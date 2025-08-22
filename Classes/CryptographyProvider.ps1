@@ -160,16 +160,15 @@ class CryptographyProvider {
             throw 'Certificate-based encryption is only supported for RSA algorithm.'
         }
         
-        if (-not $certificate.HasPublicKey) {
+        if ($null -eq $certificate.PublicKey) {
             throw 'Certificate must have a public key for encryption.'
         }
         
         try {
-            # For PowerShell 7, we need to get the RSA key differently
-            $rsa = $certificate.GetRSAPublicKey()
+            # Get the RSA public key from the certificate
+            $rsa = $certificate.PublicKey.Key
             if ($null -eq $rsa) {
-                # Fallback for older certificate formats
-                $rsa = [RSA]$certificate.PublicKey.Key
+                throw 'Unable to retrieve RSA public key from certificate.'
             }
             $encryptedBytes = $rsa.Encrypt($data, [RSAEncryptionPadding]::OaepSHA256)
             
@@ -266,11 +265,10 @@ class CryptographyProvider {
         }
         
         try {
-            # For PowerShell 7, we need to get the RSA key differently
-            $rsa = $certificate.GetRSAPrivateKey()
+            # Get the RSA private key from the certificate
+            $rsa = $certificate.PrivateKey
             if ($null -eq $rsa) {
-                # Fallback for older certificate formats
-                $rsa = [RSA]$certificate.PrivateKey
+                throw 'Unable to retrieve RSA private key from certificate.'
             }
             $data = [Convert]::FromBase64String($encryptedData.Data)
             $decryptedBytes = $rsa.Decrypt($data, [RSAEncryptionPadding]::OaepSHA256)
