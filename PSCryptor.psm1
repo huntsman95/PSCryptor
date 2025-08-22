@@ -118,63 +118,161 @@ function Protect-String {
 
 <#
 .SYNOPSIS
-    Decrypts an encrypted string using the specified algorithm and key.
+    Decrypts a string that was encrypted using Protect-String.
     
 .DESCRIPTION
-    Unprotect-String decrypts an encrypted string that was encrypted using Protect-String.
+    Unprotect-String decrypts strings that were encrypted using various algorithms.
+    Can accept either an EncryptedData object (from Protect-String) or individual 
+    parameters for more flexibility.
     
 .PARAMETER EncryptedData
-    The encrypted data object returned by Protect-String.
+    The encrypted data object returned by Protect-String (for object-based decryption).
+    
+.PARAMETER EncryptedString
+    The base64-encoded encrypted string (for parameter-based decryption).
     
 .PARAMETER Algorithm
-    The encryption algorithm that was used to encrypt the data.
+    The encryption algorithm used (AES, DES, TripleDES, RSA).
+    When using EncryptedData object, this can be omitted as it's read from the object.
     
 .PARAMETER Password
-    The password/key for symmetric encryption algorithms.
+    The password/key used for symmetric encryption algorithms.
     
 .PARAMETER Certificate
-    The X509Certificate2 object for RSA decryption (must have private key).
+    The X509Certificate2 object with private key for RSA decryption.
     
 .PARAMETER CertificatePath
-    Path to the certificate file for RSA decryption (must have private key).
+    Path to the certificate file for RSA decryption.
+    
+.PARAMETER InitializationVector
+    The initialization vector (base64-encoded) used during encryption.
+    Required for parameter-based symmetric decryption.
+    
+.PARAMETER Salt
+    The salt (base64-encoded) used for key derivation.
+    Required for parameter-based symmetric decryption.
+    
+.PARAMETER KeySize
+    The key size used during encryption.
+    Required for parameter-based symmetric decryption.
     
 .EXAMPLE
+    # Object-based decryption (current method)
+    $encrypted = Protect-String -PlainText "Secret" -Algorithm AES -Password "MyPassword123"
     $decrypted = Unprotect-String -EncryptedData $encrypted -Algorithm AES -Password "MyPassword123"
     
 .EXAMPLE
+    # Parameter-based decryption (new method)
+    $decrypted = Unprotect-String -EncryptedString "base64string..." -Algorithm AES -Password "MyPassword123" -InitializationVector "base64iv..." -Salt "base64salt..." -KeySize 256
+    
+.EXAMPLE
+    # Certificate-based decryption
     $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*MyCompany*" -and $_.HasPrivateKey }
-    $decrypted = Unprotect-String -EncryptedData $encrypted -Algorithm RSA -Certificate $cert
+    $decrypted = Unprotect-String -EncryptedData $encrypted -Certificate $cert
 #>
 function Unprotect-String {
-    [CmdletBinding(DefaultParameterSetName = 'PSK')]
+    [CmdletBinding(DefaultParameterSetName = 'ObjectPSK')]
     param(
-        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        # Object-based parameters
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = 'ObjectPSK')]
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = 'ObjectCertificate')]
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = 'ObjectCertificatePath')]
         [PSCustomObject]$EncryptedData,
         
-        [Parameter(Mandatory = $true)]
+        # Parameter-based parameters
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificate')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificatePath')]
+        [string]$EncryptedString,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [Parameter(ParameterSetName = 'ParameterCertificate')]
+        [Parameter(ParameterSetName = 'ParameterCertificatePath')]
+        [string]$InitializationVector,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [string]$Salt,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [int]$KeySize,
+        
+        # Algorithm (optional for object-based, required for parameter-based)
+        [Parameter(ParameterSetName = 'ObjectPSK')]
+        [Parameter(ParameterSetName = 'ObjectCertificate')]
+        [Parameter(ParameterSetName = 'ObjectCertificatePath')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificate')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificatePath')]
         [ValidateSet('AES', 'DES', 'TripleDES', 'RSA')]
         [string]$Algorithm,
         
-        [Parameter(Mandatory = $true, ParameterSetName = 'PSK')]
+        # Authentication parameters
+        [Parameter(Mandatory = $true, ParameterSetName = 'ObjectPSK')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
         [string]$Password,
         
-        [Parameter(Mandatory = $true, ParameterSetName = 'Certificate')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ObjectCertificate')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificate')]
         [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
         
-        [Parameter(Mandatory = $true, ParameterSetName = 'CertificatePath')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ObjectCertificatePath')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificatePath')]
         [string]$CertificatePath
     )
     
     try {
-        if ($PSCmdlet.ParameterSetName -eq 'PSK') {
-            $result = $script:CryptoProvider.DecryptString($EncryptedData, $Algorithm, $Password)
-        }
-        elseif ($PSCmdlet.ParameterSetName -eq 'Certificate') {
-            $result = $script:CryptoProvider.DecryptString($EncryptedData, $Algorithm, $Certificate)
+        # Determine if we're using object-based or parameter-based approach
+        if ($PSCmdlet.ParameterSetName -like 'Object*') {
+            # Object-based approach (current method)
+            $actualAlgorithm = if ($Algorithm) { $Algorithm } else { $EncryptedData.Algorithm }
+            
+            if ($PSCmdlet.ParameterSetName -eq 'ObjectPSK') {
+                $result = $script:CryptoProvider.DecryptString($EncryptedData, $actualAlgorithm, $Password)
+            }
+            elseif ($PSCmdlet.ParameterSetName -eq 'ObjectCertificate') {
+                $result = $script:CryptoProvider.DecryptString($EncryptedData, $actualAlgorithm, $Certificate)
+            }
+            else {
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+                $result = $script:CryptoProvider.DecryptString($EncryptedData, $actualAlgorithm, $cert)
+            }
         }
         else {
-            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
-            $result = $script:CryptoProvider.DecryptString($EncryptedData, $Algorithm, $cert)
+            # Parameter-based approach (new method)
+            if ($PSCmdlet.ParameterSetName -eq 'ParameterPSK') {
+                # Create encrypted data object from parameters
+                $encryptedDataObj = [PSCustomObject]@{
+                    Algorithm = $Algorithm
+                    KeySize   = $KeySize
+                    IV        = $InitializationVector
+                    Salt      = $Salt
+                    Data      = $EncryptedString
+                    Timestamp = $null
+                }
+                $result = $script:CryptoProvider.DecryptString($encryptedDataObj, $Algorithm, $Password)
+            }
+            elseif ($PSCmdlet.ParameterSetName -eq 'ParameterCertificate') {
+                # Create encrypted data object for RSA
+                $encryptedDataObj = [PSCustomObject]@{
+                    Algorithm             = $Algorithm
+                    KeySize               = $null
+                    Data                  = $EncryptedString
+                    CertificateThumbprint = $Certificate.Thumbprint
+                    Timestamp             = $null
+                }
+                $result = $script:CryptoProvider.DecryptString($encryptedDataObj, $Algorithm, $Certificate)
+            }
+            else {
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+                $encryptedDataObj = [PSCustomObject]@{
+                    Algorithm             = $Algorithm
+                    KeySize               = $null
+                    Data                  = $EncryptedString
+                    CertificateThumbprint = $cert.Thumbprint
+                    Timestamp             = $null
+                }
+                $result = $script:CryptoProvider.DecryptString($encryptedDataObj, $Algorithm, $cert)
+            }
         }
         
         return $result
