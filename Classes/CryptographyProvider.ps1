@@ -308,6 +308,229 @@ class CryptographyProvider {
     
     <#
     .SYNOPSIS
+        Encrypts a file using symmetric encryption with streaming for large files.
+    #>
+    [PSCustomObject] EncryptFile([string]$inputPath, [string]$outputPath, [string]$algorithm, [string]$password, [int]$keySize = 0, [byte[]]$salt = $null) {
+        if (-not $this.IsSymmetricAlgorithm($algorithm)) {
+            throw 'File encryption with password is only supported for symmetric algorithms.'
+        }
+        
+        if (-not (Test-Path $inputPath)) {
+            throw "Input file does not exist: $inputPath"
+        }
+        
+        $config = [CryptographyProvider]::AlgorithmConfig[$algorithm]
+        $actualKeySize = $keySize -gt 0 ? $keySize : $config.DefaultKeySize
+        
+        if ($actualKeySize -notin $config.KeySizes) {
+            throw "Key size $actualKeySize is not supported for algorithm $algorithm. Supported sizes: $($config.KeySizes -join ', ')"
+        }
+        
+        # Generate salt if not provided
+        if ($null -eq $salt) {
+            $salt = $this.GenerateSalt()
+        }
+        
+        $cryptoAlgorithm = $this.CreateSymmetricAlgorithm($algorithm, $actualKeySize)
+        try {
+            # Derive key from password
+            $key = $this.DeriveKey($password, $salt, $cryptoAlgorithm.KeySize / 8)
+            $cryptoAlgorithm.Key = $key
+            $cryptoAlgorithm.GenerateIV()
+            
+            # Create file streams
+            $inputStream = [FileStream]::new($inputPath, [FileMode]::Open, [FileAccess]::Read)
+            $outputStream = [FileStream]::new($outputPath, [FileMode]::Create, [FileAccess]::Write)
+            
+            try {
+                # Create crypto stream
+                $encryptor = $cryptoAlgorithm.CreateEncryptor()
+                $cryptoStream = [CryptoStream]::new($outputStream, $encryptor, [CryptoStreamMode]::Write)
+                
+                try {
+                    # Copy data through crypto stream
+                    $inputStream.CopyTo($cryptoStream)
+                    $cryptoStream.FlushFinalBlock()
+                }
+                finally {
+                    if ($null -ne $cryptoStream) { $cryptoStream.Dispose() }
+                    if ($null -ne $encryptor) { $encryptor.Dispose() }
+                }
+            }
+            finally {
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+                if ($null -ne $outputStream) { $outputStream.Dispose() }
+            }
+            
+            # Return metadata needed for decryption
+            return [PSCustomObject]@{
+                Algorithm = $algorithm
+                KeySize   = $actualKeySize
+                IV        = [Convert]::ToBase64String($cryptoAlgorithm.IV)
+                Salt      = [Convert]::ToBase64String($salt)
+                InputFile = $inputPath
+                OutputFile = $outputPath
+                Timestamp = [DateTime]::UtcNow
+            }
+        }
+        finally {
+            if ($null -ne $cryptoAlgorithm) { $cryptoAlgorithm.Dispose() }
+        }
+    }
+    
+    <#
+    .SYNOPSIS
+        Encrypts a file using certificate-based RSA encryption (for small files only).
+    #>
+    [PSCustomObject] EncryptFile([string]$inputPath, [string]$outputPath, [string]$algorithm, [X509Certificate2]$certificate) {
+        if ($algorithm -ne 'RSA') {
+            throw 'Certificate-based file encryption is only supported for RSA algorithm.'
+        }
+        
+        if (-not (Test-Path $inputPath)) {
+            throw "Input file does not exist: $inputPath"
+        }
+        
+        if ($null -eq $certificate.PublicKey) {
+            throw 'Certificate must have a public key for encryption.'
+        }
+        
+        # Check file size (RSA has limitations)
+        $fileInfo = Get-Item $inputPath
+        $maxSize = 190 # Conservative limit for RSA-2048 with OAEP padding
+        if ($fileInfo.Length -gt $maxSize) {
+            throw "File is too large for RSA encryption. Maximum size: $maxSize bytes. Current size: $($fileInfo.Length) bytes. Use symmetric encryption for larger files."
+        }
+        
+        try {
+            # Read file data
+            $data = [File]::ReadAllBytes($inputPath)
+            
+            # Encrypt using RSA
+            $rsa = $certificate.PublicKey.Key
+            if ($null -eq $rsa) {
+                throw 'Unable to retrieve RSA public key from certificate.'
+            }
+            $encryptedBytes = $rsa.Encrypt($data, [RSAEncryptionPadding]::OaepSHA256)
+            
+            # Write encrypted data to output file
+            [File]::WriteAllBytes($outputPath, $encryptedBytes)
+            
+            return [PSCustomObject]@{
+                Algorithm             = $algorithm
+                KeySize               = $rsa.KeySize
+                InputFile             = $inputPath
+                OutputFile            = $outputPath
+                CertificateThumbprint = $certificate.Thumbprint
+                Timestamp             = [DateTime]::UtcNow
+            }
+        }
+        catch {
+            throw "RSA file encryption failed: $($_.Exception.Message)"
+        }
+    }
+    
+    <#
+    .SYNOPSIS
+        Decrypts a file using symmetric encryption.
+    #>
+    [void] DecryptFile([PSCustomObject]$encryptedFileData, [string]$outputPath, [string]$algorithm, [string]$password) {
+        if (-not $this.IsSymmetricAlgorithm($algorithm)) {
+            throw 'File decryption with password is only supported for symmetric algorithms.'
+        }
+        
+        if ($encryptedFileData.Algorithm -ne $algorithm) {
+            throw "Algorithm mismatch. File was encrypted with '$($encryptedFileData.Algorithm)' but trying to decrypt with '$algorithm'."
+        }
+        
+        if (-not (Test-Path $encryptedFileData.OutputFile)) {
+            throw "Encrypted file does not exist: $($encryptedFileData.OutputFile)"
+        }
+        
+        $cryptoAlgorithm = $this.CreateSymmetricAlgorithm($algorithm, $encryptedFileData.KeySize)
+        try {
+            # Derive key from password and set IV
+            $salt = [Convert]::FromBase64String($encryptedFileData.Salt)
+            $iv = [Convert]::FromBase64String($encryptedFileData.IV)
+            $key = $this.DeriveKey($password, $salt, $cryptoAlgorithm.KeySize / 8)
+            
+            $cryptoAlgorithm.Key = $key
+            $cryptoAlgorithm.IV = $iv
+            
+            # Create file streams
+            $inputStream = [FileStream]::new($encryptedFileData.OutputFile, [FileMode]::Open, [FileAccess]::Read)
+            $outputStream = [FileStream]::new($outputPath, [FileMode]::Create, [FileAccess]::Write)
+            
+            try {
+                # Create crypto stream
+                $decryptor = $cryptoAlgorithm.CreateDecryptor()
+                $cryptoStream = [CryptoStream]::new($inputStream, $decryptor, [CryptoStreamMode]::Read)
+                
+                try {
+                    # Copy data through crypto stream
+                    $cryptoStream.CopyTo($outputStream)
+                }
+                finally {
+                    if ($null -ne $cryptoStream) { $cryptoStream.Dispose() }
+                    if ($null -ne $decryptor) { $decryptor.Dispose() }
+                }
+            }
+            finally {
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+                if ($null -ne $outputStream) { $outputStream.Dispose() }
+            }
+        }
+        finally {
+            if ($null -ne $cryptoAlgorithm) { $cryptoAlgorithm.Dispose() }
+        }
+    }
+    
+    <#
+    .SYNOPSIS
+        Decrypts a file using certificate-based RSA encryption.
+    #>
+    [void] DecryptFile([PSCustomObject]$encryptedFileData, [string]$outputPath, [string]$algorithm, [X509Certificate2]$certificate) {
+        if ($algorithm -ne 'RSA') {
+            throw 'Certificate-based file decryption is only supported for RSA algorithm.'
+        }
+        
+        if ($encryptedFileData.Algorithm -ne $algorithm) {
+            throw "Algorithm mismatch. File was encrypted with '$($encryptedFileData.Algorithm)' but trying to decrypt with '$algorithm'."
+        }
+        
+        if (-not $certificate.HasPrivateKey) {
+            throw 'Certificate must have a private key for decryption.'
+        }
+        
+        if ($certificate.Thumbprint -ne $encryptedFileData.CertificateThumbprint) {
+            Write-Warning 'Certificate thumbprint mismatch. This may not be the correct certificate for decryption.'
+        }
+        
+        if (-not (Test-Path $encryptedFileData.OutputFile)) {
+            throw "Encrypted file does not exist: $($encryptedFileData.OutputFile)"
+        }
+        
+        try {
+            # Read encrypted file data
+            $encryptedBytes = [File]::ReadAllBytes($encryptedFileData.OutputFile)
+            
+            # Decrypt using RSA
+            $rsa = $certificate.PrivateKey
+            if ($null -eq $rsa) {
+                throw 'Unable to retrieve RSA private key from certificate.'
+            }
+            $decryptedBytes = $rsa.Decrypt($encryptedBytes, [RSAEncryptionPadding]::OaepSHA256)
+            
+            # Write decrypted data to output file
+            [File]::WriteAllBytes($outputPath, $decryptedBytes)
+        }
+        catch {
+            throw "RSA file decryption failed: $($_.Exception.Message)"
+        }
+    }
+    
+    <#
+    .SYNOPSIS
         Gets information about supported algorithms.
     #>
     [PSCustomObject[]] GetSupportedAlgorithms() {

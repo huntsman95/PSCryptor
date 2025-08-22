@@ -649,6 +649,269 @@ function Test-CryptographyProvider {
     }
 }
 
+<#
+.SYNOPSIS
+    Encrypts a file using the specified algorithm and key.
+    
+.DESCRIPTION
+    Protect-File encrypts files using various cryptographic algorithms with streaming
+    support for large files. Uses FileStreams for efficient memory usage.
+    
+.PARAMETER InputPath
+    Path to the file to encrypt.
+    
+.PARAMETER OutputPath
+    Path where the encrypted file will be saved.
+    
+.PARAMETER Algorithm
+    The encryption algorithm to use (AES, DES, TripleDES, RSA).
+    
+.PARAMETER Password
+    The password/key for symmetric encryption algorithms.
+    
+.PARAMETER Certificate
+    The X509Certificate2 object for RSA encryption.
+    
+.PARAMETER CertificatePath
+    Path to the certificate file for RSA encryption.
+    
+.PARAMETER KeySize
+    The key size for the encryption algorithm (optional).
+    
+.PARAMETER Salt
+    Custom salt for key derivation (optional).
+    
+.PARAMETER Force
+    Overwrite the output file if it already exists.
+    
+.EXAMPLE
+    Protect-File -InputPath "C:\docs\secret.txt" -OutputPath "C:\docs\secret.txt.encrypted" -Algorithm AES -Password "MySecretKey"
+    
+.EXAMPLE
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*MyCompany*" }
+    Protect-File -InputPath "C:\docs\small.txt" -OutputPath "C:\docs\small.txt.encrypted" -Algorithm RSA -Certificate $cert
+#>
+function Protect-File {
+    [CmdletBinding(DefaultParameterSetName = 'PSK')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({ Test-Path $_ })]
+        [string]$InputPath,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('AES', 'DES', 'TripleDES', 'RSA')]
+        [string]$Algorithm,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'PSK')]
+        [string]$Password,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'Certificate')]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'CertificatePath')]
+        [string]$CertificatePath,
+        
+        [Parameter()]
+        [int]$KeySize,
+        
+        [Parameter()]
+        [byte[]]$Salt,
+        
+        [Parameter()]
+        [switch]$Force
+    )
+    
+    try {
+        # Check if output file exists and Force is not specified
+        if ((Test-Path $OutputPath) -and -not $Force) {
+            throw "Output file already exists: $OutputPath. Use -Force to overwrite."
+        }
+        
+        # Get absolute paths
+        $InputPath = Resolve-Path $InputPath
+        $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+        
+        if ($PSCmdlet.ParameterSetName -eq 'PSK') {
+            $result = $script:CryptoProvider.EncryptFile($InputPath, $OutputPath, $Algorithm, $Password, $KeySize, $Salt)
+        }
+        elseif ($PSCmdlet.ParameterSetName -eq 'Certificate') {
+            $result = $script:CryptoProvider.EncryptFile($InputPath, $OutputPath, $Algorithm, $Certificate)
+        }
+        else {
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+            $result = $script:CryptoProvider.EncryptFile($InputPath, $OutputPath, $Algorithm, $cert)
+        }
+        
+        Write-Verbose "File encrypted successfully: $InputPath -> $OutputPath"
+        return $result
+    }
+    catch {
+        Write-Error "Failed to encrypt file: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Decrypts a file that was encrypted using Protect-File.
+    
+.DESCRIPTION
+    Unprotect-File decrypts files that were encrypted using various algorithms with
+    streaming support for large files.
+    
+.PARAMETER EncryptedFileData
+    The encrypted file metadata object returned by Protect-File.
+    
+.PARAMETER OutputPath
+    Path where the decrypted file will be saved.
+    
+.PARAMETER Algorithm
+    The encryption algorithm used (AES, DES, TripleDES, RSA).
+    
+.PARAMETER Password
+    The password/key used for symmetric encryption algorithms.
+    
+.PARAMETER Certificate
+    The X509Certificate2 object with private key for RSA decryption.
+    
+.PARAMETER CertificatePath
+    Path to the certificate file for RSA decryption.
+    
+.PARAMETER Force
+    Overwrite the output file if it already exists.
+    
+.EXAMPLE
+    $fileData = Protect-File -InputPath "C:\docs\secret.txt" -OutputPath "C:\docs\secret.txt.encrypted" -Algorithm AES -Password "MySecretKey"
+    Unprotect-File -EncryptedFileData $fileData -OutputPath "C:\docs\decrypted.txt" -Algorithm AES -Password "MySecretKey"
+    
+.EXAMPLE
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*MyCompany*" -and $_.HasPrivateKey }
+    Unprotect-File -EncryptedFileData $fileData -OutputPath "C:\docs\decrypted.txt" -Algorithm RSA -Certificate $cert
+#>
+function Unprotect-File {
+    [CmdletBinding(DefaultParameterSetName = 'PSK')]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = 'PSK')]
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = 'Certificate')]
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = 'CertificatePath')]
+        [PSCustomObject]$EncryptedFileData,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificate')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificatePath')]
+        [string]$InputPath,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('AES', 'DES', 'TripleDES', 'RSA')]
+        [string]$Algorithm,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'PSK')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterPSK')]
+        [string]$Password,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'Certificate')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificate')]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'CertificatePath')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'ParameterCertificatePath')]
+        [string]$CertificatePath,
+        
+        [Parameter(ParameterSetName = 'ParameterPSK')]
+        [Parameter(ParameterSetName = 'ParameterCertificate')]
+        [Parameter(ParameterSetName = 'ParameterCertificatePath')]
+        [string]$InitializationVector,
+        
+        [Parameter(ParameterSetName = 'ParameterPSK')]
+        [Parameter(ParameterSetName = 'ParameterCertificate')]
+        [Parameter(ParameterSetName = 'ParameterCertificatePath')]
+        [string]$Salt,
+        
+        [Parameter(ParameterSetName = 'ParameterPSK')]
+        [Parameter(ParameterSetName = 'ParameterCertificate')]
+        [Parameter(ParameterSetName = 'ParameterCertificatePath')]
+        [int]$KeySize,
+        
+        [Parameter()]
+        [switch]$Force
+    )
+    
+    try {
+        # Check if output file exists and Force is not specified
+        if ((Test-Path $OutputPath) -and -not $Force) {
+            throw "Output file already exists: $OutputPath. Use -Force to overwrite."
+        }
+        
+        # Get absolute path
+        $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+        
+        # Handle parameter-based approach
+        if ($PSCmdlet.ParameterSetName -like 'Parameter*') {
+            # Get absolute input path
+            $InputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputPath)
+            
+            # For parameter-based approach, we need to provide default values or require them
+            # For symmetric algorithms, we need KeySize, IV, and Salt
+            if ($Algorithm -in @('AES', 'DES', 'TripleDES')) {
+                if (-not $KeySize) {
+                    # Set default key sizes
+                    $KeySize = switch ($Algorithm) {
+                        'AES' { 256 }
+                        'DES' { 64 }
+                        'TripleDES' { 192 }
+                    }
+                }
+                
+                # Create EncryptedFileData object from parameters
+                $EncryptedFileData = [PSCustomObject]@{
+                    Algorithm = $Algorithm
+                    KeySize = $KeySize
+                    InputFile = $InputPath
+                    OutputFile = $InputPath  # This is the encrypted file path
+                    IV = $InitializationVector
+                    Salt = $Salt
+                }
+            } else {
+                # For RSA, we don't need IV and Salt
+                $EncryptedFileData = [PSCustomObject]@{
+                    Algorithm = $Algorithm
+                    KeySize = $KeySize
+                    InputFile = $InputPath
+                    OutputFile = $InputPath  # This is the encrypted file path
+                    CertificateThumbprint = $null  # Will be set based on certificate parameter
+                }
+            }
+        }
+        
+        if ($PSCmdlet.ParameterSetName -eq 'PSK' -or $PSCmdlet.ParameterSetName -eq 'ParameterPSK') {
+            $script:CryptoProvider.DecryptFile($EncryptedFileData, $OutputPath, $Algorithm, $Password)
+        }
+        elseif ($PSCmdlet.ParameterSetName -eq 'Certificate' -or $PSCmdlet.ParameterSetName -eq 'ParameterCertificate') {
+            $script:CryptoProvider.DecryptFile($EncryptedFileData, $OutputPath, $Algorithm, $Certificate)
+        }
+        else {
+            if ($PSCmdlet.ParameterSetName -like 'Parameter*') {
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+            } else {
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+            }
+            $script:CryptoProvider.DecryptFile($EncryptedFileData, $OutputPath, $Algorithm, $cert)
+        }
+        
+        Write-Verbose "File decrypted successfully: $($EncryptedFileData.OutputFile) -> $OutputPath"
+        Write-Output "File decrypted successfully to: $OutputPath"
+    }
+    catch {
+        Write-Error "Failed to decrypt file: $($_.Exception.Message)"
+    }
+}
+
 #endregion
 
 # Export functions
@@ -657,6 +920,8 @@ Export-ModuleMember -Function @(
     'Unprotect-String',
     'Protect-ByteArray', 
     'Unprotect-ByteArray',
+    'Protect-File',
+    'Unprotect-File',
     'New-CryptographyKey',
     'Get-SupportedAlgorithms',
     'Test-CryptographyProvider'
